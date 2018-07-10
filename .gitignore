@@ -1,3 +1,11 @@
+private_vars.*
+NewSamTemplate.json
+ProcessedSamTemplate.json
+
+*~
+*#
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
