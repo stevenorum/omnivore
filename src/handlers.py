@@ -21,13 +21,8 @@ root.addHandler(ch)
 for noisy in ('botocore', 'boto3', 'requests'):
     logging.getLogger(noisy).level = logging.WARN
 
-try:
-    with open("/var/task/static_config.json") as f:
-        data = json.load(f)
-        for k in data:
-            os.environ[k] = data[k].strip()
-except:
-    logging.exception("Unable to add static info to the path.  Falling back to the bundled defaults.")
+S3 = boto3.resource("s3").Bucket(os.environ["DATA_BUCKET"])
+DDB = boto3.resource("dynamodb").Table(os.environ["DATA_TABLE"])
 
 def make_response(body, code=200, headers={}, base64=False):
     _headers = {"Content-Type": "text/html"}
@@ -39,22 +34,30 @@ def make_response(body, code=200, headers={}, base64=False):
         "isBase64Encoded": base64
     }
 
-BUCKET_NAME = os.environ["DATA_BUCKET"]
-TABLE_NAME = os.environ["DATA_TABLE"]
-
-S3 = boto3.client("s3")
-DDB = boto3.client("dynamodb")
-
 def apigateway_handler(event, context):
     print(json.dumps(event))
     if event["httpMethod"] == "POST" and event.get("body") and event["path"] == "/store":
-        data = urllib.parse.parse_qs(event["body"])
+        body = event.get("body")
+        if body.startswith("{"):
+            try:
+                data = json.loads(body)
+            except:
+                traceback.print_exc()
+                raise
+        else:
+            try:
+                data = urllib.parse.parse_qs(body)
+                data = {k:data[k][0] for k in data if len(data[k]) > 0}
+            except:
+                traceback.print_exc()
+                raise
         if "data" in data and "source" in data:
-            if "content-type" in data:
-                store_data(data["data"][0], data["source"][0], data["content-type"][0])
-            else:
-                store_data(data["data"][0], data["source"][0])
-            return make_response(body='{"success":true}', code=200, headers={"Content-Type": "text/json"})
+            data_record = store_data(data["data"], data["source"], data.get("content-type"))
+            return make_response(body=json.dumps(data_record), code=200, headers={"Content-Type": "text/json"})
+        else:
+            logging.warn("Missing either/both of data and source")
+    else:
+        logging.warn("Method, body, or path are incorrect.")
     return make_response(body="Required arguments are missing.", code=400)
 
 def now():
@@ -68,26 +71,30 @@ def bytify(data):
     else:
         return data
 
-def store_data(data, source, content_type="application/octet-stream"):
+def store_data(data, source, content_type=None):
+    content_type = content_type if content_type else "application/octet-stream"
     identifier = secrets.token_urlsafe(64)
     item = {
-        "identifier":{"S":identifier},
-        "source":{"S":source},
-        "received":{"S":now()}
+        "identifier":identifier,
+        "source":source,
+        "received":now()
     }
     CE = Attr("identifier").not_exists()
-    for i in range(10):
+    ATTEMPTS = 10
+    for i in range(1, ATTEMPTS+1):
         try:
-            response = DDB.put_item(TableName=TABLE_NAME, Item=item, ConditionExpression=CE)
-            print(response)
+            response = DDB.put_item(Item=item, ConditionExpression=CE)
+            logging.debug(response)
             break
         except:
             traceback.print_exc()
+            if i >= ATTEMPTS:
+                raise
             identifier = secrets.token_urlsafe(64)
-            item["identifier"]["S"] = identifier
-    response = S3.put_object(Bucket=BUCKET_NAME,
-                             Key=identifier,
+            item["identifier"] = identifier
+    response = S3.put_object(Key=identifier,
                              Body=bytify(data),
-                             Metadata={"source":source,"received":item["received"]["S"]},
+                             Metadata={"source":source,"received":item["received"]},
                              ContentType=content_type)
-    print(response)
+    logging.debug(response)
+    return item
